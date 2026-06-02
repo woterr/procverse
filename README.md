@@ -1,3 +1,7 @@
+# Procverse (process-universe)
+
+Built with Rust, Ratatui, and a custom force directed physics engine.
+
 # Run
 
 ```bash
