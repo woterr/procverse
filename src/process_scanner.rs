@@ -5,13 +5,13 @@ use std::thread;
 use std::time::Duration;
 
 pub struct ProcessInfo {
-    pub pid: u32,
     pub ppid: u32,
     pub name: String,
     pub exe: String,
     pub threads: u32,
     pub memory: u64,
     pub start_time: u64,
+    pub cpu_usage: f32,
 }
 
 pub struct ProcessSnapshot {
@@ -59,14 +59,24 @@ fn parse_stat(pid: u32) -> Option<ProcessInfo> {
     parts.next()?;
     let ppid: u32 = parts.next()?.parse().ok()?;
 
-    for _ in 0..16 {
+    for _ in 0..15 {
         parts.next()?;
     }
 
     let threads: u32 = parts.next()?.parse().unwrap_or(1);
     parts.next()?;
     let start_time: u64 = parts.next()?.parse().unwrap_or(0);
-    let memory: u64 = parts.next()?.parse().unwrap_or(0);
+
+    let memory = if let Ok(statm) = fs::read_to_string(format!("/proc/{}/statm", pid)) {
+        statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 4096
+    } else {
+        0
+    };
 
     let exe_path = format!("/proc/{}/exe", pid);
     let exe = fs::read_link(&exe_path)
@@ -74,12 +84,12 @@ fn parse_stat(pid: u32) -> Option<ProcessInfo> {
         .unwrap_or_else(|_| String::new());
 
     Some(ProcessInfo {
-        pid,
         ppid,
         name,
         exe,
         threads,
         memory,
         start_time,
+        cpu_usage: 0.0,
     })
 }

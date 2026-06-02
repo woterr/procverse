@@ -4,7 +4,7 @@ mod process_scanner;
 mod renderer;
 
 use crossterm::{
-    event::{self, Event, KeyCode, MouseEventKind, MouseButton},
+    event::{self, Event, KeyCode, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -23,6 +23,13 @@ pub enum AppMode {
     Search,
 }
 
+pub enum OverlayMode {
+    Normal,
+    Memory,
+    Threads,
+    Cpu,
+}
+
 fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -37,12 +44,14 @@ fn main() -> anyhow::Result<()> {
 
     let mut graph = Graph::new();
     let mut tick = 0.0;
-    
+
     let mut mode = AppMode::Normal;
     let mut search_query = String::new();
-    
+
     let mut userland_view = true;
     let mut show_all_labels = false;
+    let mut overlay_mode = OverlayMode::Normal;
+    let mut show_path_panel = false;
 
     let mut last_frame = Instant::now();
     let mut fps = 0.0;
@@ -79,7 +88,21 @@ fn main() -> anyhow::Result<()> {
         }
 
         let terminal_size = terminal.size()?;
-        terminal.draw(|f| renderer::draw(f, &graph, &mode, &search_query, fps, userland_view, show_all_labels))?;
+        terminal.draw(|f| {
+            renderer::draw(
+                f,
+                &graph,
+                &mode,
+                &search_query,
+                fps,
+                userland_view,
+                show_all_labels,
+                &overlay_mode,
+                show_path_panel,
+                terminal_size.width,
+                terminal_size.height,
+            )
+        })?;
 
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
@@ -92,18 +115,23 @@ fn main() -> anyhow::Result<()> {
                             }
                             KeyCode::Enter => {
                                 if let Some(idx) = graph.nodes.iter().position(|n| {
-                                    n.name.to_lowercase().contains(&search_query.to_lowercase()) 
-                                    && n.state != NodeState::Dead
-                                    && !n.is_hidden
-                                    && !(userland_view && n.is_kernel_thread)
+                                    n.name.to_lowercase().contains(&search_query.to_lowercase())
+                                        && n.state != NodeState::Dead
+                                        && !n.is_hidden
+                                        && !(userland_view && n.is_kernel_thread)
                                 }) {
                                     graph.selected_idx = Some(idx);
+                                    graph.center_on_selection();
                                 }
                                 mode = AppMode::Normal;
                                 search_query.clear();
                             }
-                            KeyCode::Backspace => { search_query.pop(); }
-                            KeyCode::Char(c) => { search_query.push(c); }
+                            KeyCode::Backspace => {
+                                search_query.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                search_query.push(c);
+                            }
                             _ => {}
                         }
                     } else {
@@ -116,27 +144,54 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Char(' ') => {
                                 if let Some(idx) = graph.selected_idx {
                                     if graph.nodes[idx].is_cluster {
-                                        graph.nodes[idx].cluster_expanded = !graph.nodes[idx].cluster_expanded;
+                                        graph.nodes[idx].cluster_expanded =
+                                            !graph.nodes[idx].cluster_expanded;
                                     }
                                 }
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                overlay_mode = match overlay_mode {
+                                    OverlayMode::Normal => OverlayMode::Memory,
+                                    OverlayMode::Memory => OverlayMode::Threads,
+                                    OverlayMode::Threads => OverlayMode::Cpu,
+                                    OverlayMode::Cpu => OverlayMode::Normal,
+                                };
+                            }
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                show_path_panel = !show_path_panel;
+                            }
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                graph.trace_mode = !graph.trace_mode;
                             }
                             KeyCode::Char('u') | KeyCode::Char('U') => {
                                 userland_view = !userland_view;
                                 if userland_view {
                                     if let Some(idx) = graph.selected_idx {
                                         if graph.nodes[idx].is_kernel_thread {
-                                            graph.selected_idx = graph.nodes.iter().position(|n| n.pid == 1 && n.state != NodeState::Dead).or(Some(0));
+                                            graph.selected_idx = graph
+                                                .nodes
+                                                .iter()
+                                                .position(|n| {
+                                                    n.pid == 1 && n.state != NodeState::Dead
+                                                })
+                                                .or(Some(0));
                                         }
                                     }
                                 }
                             }
-                            KeyCode::Char('l') | KeyCode::Char('L') => { show_all_labels = !show_all_labels; }
+                            KeyCode::Char('l') | KeyCode::Char('L') => {
+                                show_all_labels = !show_all_labels;
+                            }
                             KeyCode::Enter => graph.focus_mode = !graph.focus_mode,
                             KeyCode::Tab => {
                                 if !graph.nodes.is_empty() {
                                     let start = graph.selected_idx.unwrap_or(0);
                                     let mut next = (start + 1) % graph.nodes.len();
-                                    while (graph.nodes[next].state == NodeState::Dead || graph.nodes[next].is_hidden || (userland_view && graph.nodes[next].is_kernel_thread)) && next != start {
+                                    while (graph.nodes[next].state == NodeState::Dead
+                                        || graph.nodes[next].is_hidden
+                                        || (userland_view && graph.nodes[next].is_kernel_thread))
+                                        && next != start
+                                    {
                                         next = (next + 1) % graph.nodes.len();
                                     }
                                     graph.selected_idx = Some(next);
@@ -146,8 +201,25 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Down => graph.camera.y -= 10.0 / graph.camera.zoom.max(0.1),
                             KeyCode::Right => graph.camera.x += 10.0 / graph.camera.zoom.max(0.1),
                             KeyCode::Left => graph.camera.x -= 10.0 / graph.camera.zoom.max(0.1),
-                            KeyCode::Char('+') => graph.camera.zoom *= 1.2,
-                            KeyCode::Char('-') => graph.camera.zoom /= 1.2,
+                            KeyCode::Char('+') => {
+                                graph.camera.zoom *= 1.2;
+                            }
+                            KeyCode::Char('-') => {
+                                let fit_zoom = graph.calculate_fit_zoom();
+                                let min_zoom = fit_zoom * 0.75;
+                                let next_zoom = graph.camera.zoom / 1.2;
+
+                                // Soft Limit Spring
+                                if next_zoom > min_zoom {
+                                    graph.camera.zoom = next_zoom;
+                                } else {
+                                    let resistance =
+                                        (graph.camera.zoom - min_zoom) / (min_zoom * 0.5);
+                                    graph.camera.zoom = (graph.camera.zoom
+                                        / (1.0 + (0.2 * resistance.max(0.01))))
+                                    .max(min_zoom);
+                                }
+                            }
                             KeyCode::Char('f') => graph.center_on_selection(),
                             KeyCode::Home => graph.auto_fit_camera(),
                             _ => {}
@@ -156,37 +228,59 @@ fn main() -> anyhow::Result<()> {
                 }
                 Event::Mouse(mouse_event) => {
                     let canvas_width = (terminal_size.width as f32 * 0.75).floor();
-                    let canvas_height = terminal_size.height.saturating_sub(1) as f32;
+                    let canvas_height = terminal_size.height.saturating_sub(2) as f32; // Header + Status
                     let col = mouse_event.column as f32;
                     let row = mouse_event.row as f32;
 
-                    if col <= canvas_width && row <= canvas_height {
+                    if col <= canvas_width && row <= canvas_height && row > 0.0 {
                         let math_x = (col / canvas_width) * 200.0 - 100.0;
-                        let math_y = 100.0 - (row / canvas_height) * 200.0;
+                        let math_y = 100.0 - ((row - 1.0) / canvas_height) * 200.0;
                         let world_x = (math_x / graph.camera.zoom) + graph.camera.x;
                         let world_y = (math_y / graph.camera.zoom) + graph.camera.y;
 
                         match mouse_event.kind {
-                            MouseEventKind::ScrollUp => { graph.camera.zoom *= 1.2; }
-                            MouseEventKind::ScrollDown => { graph.camera.zoom /= 1.2; }
+                            MouseEventKind::ScrollUp => {
+                                graph.camera.zoom *= 1.2;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                let fit_zoom = graph.calculate_fit_zoom();
+                                let min_zoom = fit_zoom * 0.75;
+                                let next_zoom = graph.camera.zoom / 1.2;
+
+                                if next_zoom > min_zoom {
+                                    graph.camera.zoom = next_zoom;
+                                } else {
+                                    let resistance =
+                                        (graph.camera.zoom - min_zoom) / (min_zoom * 0.5);
+                                    graph.camera.zoom = (graph.camera.zoom
+                                        / (1.0 + (0.2 * resistance.max(0.01))))
+                                    .max(min_zoom);
+                                }
+                            }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 is_dragging = true;
                                 last_mouse_col = mouse_event.column;
                                 last_mouse_row = mouse_event.row;
                                 graph.select_nearest(world_x, world_y, userland_view);
                             }
-                            MouseEventKind::Up(MouseButton::Left) => { is_dragging = false; }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                is_dragging = false;
+                            }
                             MouseEventKind::Drag(MouseButton::Left) => {
                                 if is_dragging {
                                     let dx = mouse_event.column as f32 - last_mouse_col as f32;
                                     let dy = mouse_event.row as f32 - last_mouse_row as f32;
-                                    graph.camera.x -= dx * (200.0 / canvas_width) / graph.camera.zoom;
-                                    graph.camera.y += dy * (200.0 / canvas_height) / graph.camera.zoom;
+                                    graph.camera.x -=
+                                        dx * (200.0 / canvas_width) / graph.camera.zoom;
+                                    graph.camera.y +=
+                                        dy * (200.0 / canvas_height) / graph.camera.zoom;
                                     last_mouse_col = mouse_event.column;
                                     last_mouse_row = mouse_event.row;
                                 }
                             }
-                            MouseEventKind::Down(MouseButton::Middle) => { graph.auto_fit_camera(); }
+                            MouseEventKind::Down(MouseButton::Middle) => {
+                                graph.auto_fit_camera();
+                            }
                             _ => {}
                         }
                     }
@@ -197,6 +291,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, event::DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        event::DisableMouseCapture
+    )?;
     Ok(())
 }

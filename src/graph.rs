@@ -26,7 +26,6 @@ pub enum Importance {
 }
 
 pub struct ProcessEvent {
-    pub timestamp: u64,
     pub name: String,
     pub event_type: EventType,
 }
@@ -45,6 +44,7 @@ pub struct Node {
     pub threads: u32,
     pub memory: u64,
     pub start_time: u64,
+    pub cpu_usage: f32,
 
     pub pos: Vec2,
     pub vel: Vec2,
@@ -73,24 +73,27 @@ pub struct Edge {
 pub struct GraphDiagnostics {
     pub total_nodes: usize,
     pub total_edges: usize,
+    pub total_clusters: usize,
     pub avg_dist: f32,
-    pub max_dist: f32,
     pub min_x: f32,
     pub max_x: f32,
     pub min_y: f32,
     pub max_y: f32,
     pub max_depth: u32,
-    pub avg_depth: f32,
 }
 
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
-    pub stars: Vec<Vec2>,
     pub camera: Camera,
     pub selected_idx: Option<usize>,
     pub focus_mode: bool,
+    pub trace_mode: bool,
     pub events: VecDeque<ProcessEvent>,
+
+    pub max_memory: u64,
+    pub max_threads: u32,
+    pub max_cpu: f32,
 }
 
 pub fn is_kernel_process(name: &str) -> bool {
@@ -208,20 +211,9 @@ fn classify_importance(name: &str) -> Importance {
 
 impl Graph {
     pub fn new() -> Self {
-        let mut stars = Vec::new();
-        let mut seed = 12345u32;
-        for _ in 0..100 {
-            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            let x = (seed % 200) as f32 - 100.0;
-            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            let y = (seed % 200) as f32 - 100.0;
-            stars.push(Vec2::new(x, y));
-        }
-
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
-            stars,
             camera: Camera {
                 x: 0.0,
                 y: 0.0,
@@ -229,7 +221,11 @@ impl Graph {
             },
             selected_idx: Some(0),
             focus_mode: false,
+            trace_mode: false,
             events: VecDeque::with_capacity(15),
+            max_memory: 0,
+            max_threads: 0,
+            max_cpu: 0.0,
         }
     }
 
@@ -240,6 +236,7 @@ impl Graph {
             .filter(|n| n.state != NodeState::Dead && !n.is_hidden)
             .collect::<Vec<_>>();
         let total_nodes = active_nodes.len();
+        let total_clusters = active_nodes.iter().filter(|n| n.is_cluster).count();
 
         let total_edges = self
             .edges
@@ -256,32 +253,26 @@ impl Graph {
             return GraphDiagnostics {
                 total_nodes: 0,
                 total_edges: 0,
+                total_clusters: 0,
                 avg_dist: 0.0,
-                max_dist: 0.0,
                 min_x: 0.0,
                 max_x: 0.0,
                 min_y: 0.0,
                 max_y: 0.0,
                 max_depth: 0,
-                avg_depth: 0.0,
             };
         }
 
         let mut sum_dist = 0.0;
-        let mut max_dist: f32 = 0.0;
         let mut min_x = f32::MAX;
         let mut max_x = f32::MIN;
         let mut min_y = f32::MAX;
         let mut max_y = f32::MIN;
         let mut max_depth = 0;
-        let mut sum_depth = 0.0;
 
         for n in &active_nodes {
             let dist = n.pos.length();
             sum_dist += dist;
-            if dist > max_dist {
-                max_dist = dist;
-            }
 
             if n.pos.x < min_x {
                 min_x = n.pos.x;
@@ -299,30 +290,37 @@ impl Graph {
             if n.depth > max_depth {
                 max_depth = n.depth;
             }
-            sum_depth += n.depth as f32;
         }
 
         GraphDiagnostics {
             total_nodes,
             total_edges,
+            total_clusters,
             avg_dist: sum_dist / total_nodes as f32,
-            max_dist,
             min_x,
             max_x,
             min_y,
             max_y,
             max_depth,
-            avg_depth: sum_depth / total_nodes as f32,
         }
+    }
+
+    pub fn calculate_fit_zoom(&self) -> f32 {
+        let diag = self.compute_diagnostics();
+        let width = (diag.max_x - diag.min_x).max(10.0);
+        let height = (diag.max_y - diag.min_y).max(10.0);
+
+        let zoom_x = 200.0 / width;
+        let zoom_y = 200.0 / height;
+
+        zoom_x.min(zoom_y)
     }
 
     pub fn auto_fit_camera(&mut self) {
         let diag = self.compute_diagnostics();
-        let width = diag.max_x - diag.min_x;
-        let height = diag.max_y - diag.min_y;
+        let fit_zoom = self.calculate_fit_zoom();
 
-        let max_span = width.max(height).max(0.1);
-        self.camera.zoom = 180.0 / max_span;
+        self.camera.zoom = fit_zoom * 0.9;
         self.camera.x = (diag.min_x + diag.max_x) / 2.0;
         self.camera.y = (diag.min_y + diag.max_y) / 2.0;
     }
@@ -362,12 +360,7 @@ impl Graph {
     }
 
     pub fn log_event(&mut self, name: &str, event_type: EventType) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         self.events.push_front(ProcessEvent {
-            timestamp: now,
             name: name.to_string(),
             event_type,
         });
@@ -392,6 +385,10 @@ impl Graph {
                 node.state = NodeState::Dying;
                 node.death_timer = 1.0;
                 exited_processes.push(node.name.clone());
+            } else if let Some(info) = snapshot.processes.get(&node.pid) {
+                node.memory = info.memory;
+                node.threads = info.threads;
+                node.cpu_usage = info.cpu_usage;
             }
         }
 
@@ -434,6 +431,7 @@ impl Graph {
                     threads: info.threads,
                     memory: info.memory,
                     start_time: info.start_time,
+                    cpu_usage: info.cpu_usage,
                     pos: spawn_pos,
                     vel: Vec2::ZERO,
                     fixed: *pid == 1,
@@ -505,6 +503,7 @@ impl Graph {
                 threads: 0,
                 memory: 0,
                 start_time: now,
+                cpu_usage: 0.0,
                 pos: parent_pos,
                 vel: Vec2::ZERO,
                 fixed: false,
@@ -539,12 +538,19 @@ impl Graph {
                 let expanded = self.nodes[c_idx].cluster_expanded;
                 let c_pos = self.nodes[c_idx].pos;
 
+                let mut cluster_mem = 0;
+                let mut cluster_threads = 0;
+
                 for &m_idx in members {
+                    cluster_mem += self.nodes[m_idx].memory;
+                    cluster_threads += self.nodes[m_idx].threads;
                     self.nodes[m_idx].is_hidden = !expanded;
                     if !expanded {
                         self.nodes[m_idx].pos = c_pos;
                     }
                 }
+                self.nodes[c_idx].memory = cluster_mem;
+                self.nodes[c_idx].threads = cluster_threads;
             }
         }
 
@@ -559,7 +565,6 @@ impl Graph {
             }
         }
 
-        // --- Edge Rebuilding & Orphan Tether ---
         self.edges.clear();
         let init_idx = self
             .nodes
@@ -612,9 +617,6 @@ impl Graph {
                 }
             }
 
-            // The Anti-Drift Orphan Fix:
-            // If a node (like PID 2 which has PPID 0) has no valid parent in the graph,
-            // tether it to PID 1 so it cannot drift into deep space infinitely.
             if !parent_found {
                 if let Some(init) = init_idx {
                     if i != init {
@@ -646,6 +648,46 @@ impl Graph {
                 }
             }
         }
+
+        self.max_memory = 0;
+        self.max_threads = 0;
+        self.max_cpu = 0.0;
+        for n in &self.nodes {
+            if n.state != NodeState::Dead && !n.is_hidden {
+                self.max_memory = self.max_memory.max(n.memory);
+                self.max_threads = self.max_threads.max(n.threads);
+                if n.cpu_usage > self.max_cpu {
+                    self.max_cpu = n.cpu_usage;
+                }
+            }
+        }
+    }
+
+    pub fn get_process_path(&self, start_idx: usize) -> Vec<usize> {
+        let mut path = Vec::new();
+        let mut current = start_idx;
+        let mut visited = HashSet::new();
+
+        loop {
+            path.push(current);
+            visited.insert(current);
+
+            let mut found_parent = false;
+            for edge in &self.edges {
+                if edge.to == current {
+                    if !visited.contains(&edge.from) {
+                        current = edge.from;
+                        found_parent = true;
+                    }
+                    break;
+                }
+            }
+            if !found_parent {
+                break;
+            }
+        }
+        path.reverse();
+        path
     }
 
     pub fn get_ancestors(&self, start_idx: usize) -> HashSet<usize> {
@@ -683,9 +725,5 @@ impl Graph {
             }
         }
         descendants
-    }
-
-    pub fn get_children_count(&self, idx: usize) -> usize {
-        self.edges.iter().filter(|e| e.from == idx).count()
     }
 }
